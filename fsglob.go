@@ -1,13 +1,56 @@
-// package fsglob provides functionality for finding files and directories
-// by matching their path names against a pattern.
-// Aim to support:
-//   - `?`: Matches any single character in a file or directory name.
-//   - `*`: Matches zero or more characters in a file or directory name.
-//   - `**`: Matches zero or more recursive directories.
-//   - `[...]`: Matches a set of characters in a name (e.g., `[abc]`, `[a-z]`).
-//   - `{group1,group2,...}`: Matches any of the pattern groups.
-//
-// Case-insensitivity is the default behavior for matching.
+// Package fsglob provides a powerful and extensible library for globbing, finding file
+// paths that match standard Unix-style glob patterns.
+
+// The main entrypoint is the GetFiles function, which provides a simple interface for
+// common use cases. The package is designed to be cross-platform, automatically
+// handling both forward and backslashes in patterns, and can be extended to work
+// with any virtual filesystem.
+
+// Features:
+//   - Standard Glob Syntax: Supports `*`, `?`, `**`, `[]`, and `{}`.
+//   - Cross-Platform: Correctly handles path separators on both Windows and Unix.
+//   - Extensible: Operates on any filesystem that implements the filesystem.Filesystem
+//     interface, perfect for testing or use with virtual filesystems like afero.
+//   - Case-Insensitive Option: Provides an option for case-insensitive matching.
+
+// Quick Start
+
+// To find all Go files recursively from the current directory:
+//     goFiles, err := fsglob.GetFiles("**/*.go")
+//     if err != nil {
+//         // Handle error
+//     }
+//     for _, file := range goFiles {
+//         fmt.Println(file)
+//     }
+
+// Pattern Matching
+
+// The following pattern syntax is supported:
+
+// | Pattern | Description                                                               | Example                  |
+// | :------ | :------------------------------------------------------------------------ | :----------------------- |
+// | `*`     | Matches any sequence of characters, except for path separators.           | `*.log`                  |
+// | `?`     | Matches any single character.                                             | `file?.txt`              |
+// | `**`    | Matches zero or more directories recursively.                             | `reports/**/*.xml`       |
+// | `[]`    | Matches any single character within the brackets (e.g., [abc], [a-z]).    | `[a-c].go`               |
+// | `{}`    | Brace expansion matches any of the comma-separated patterns.              | `image.{jpg,png,gif}`    |
+
+// Advanced Usage: Custom Filesystem and Options
+
+// For more control, such as using a custom filesystem for testing or enabling
+// case-insensitive matching, use NewGlob.
+
+//     // Create a new globber with case-insensitivity enabled.
+//     // On Windows, matching is case-insensitive by default for non-wildcard patterns.
+//     g := fsglob.NewGlob("reports/*.{XML,json}", fs, fsglob.WithIgnoreCase(true))
+
+//     matches, err := g.Expand()
+//     if err != nil {
+//         // Handle error
+//     }
+//     fmt.Println("Found matches:", matches)
+
 package fsglob
 
 import (
@@ -42,6 +85,9 @@ var (
 	cacheMutex = &sync.Mutex{}
 )
 
+// RegexOrString is a helper struct that holds either a compiled regular expression
+// or a literal string for efficient pattern matching. It is used internally to
+// optimize matching by avoiding regex compilation for simple patterns.
 type RegexOrString struct {
 	// CompiledRegex is the compiled regular expression if the pattern segment contains wildcards.
 	CompiledRegex *regexp.Regexp
@@ -68,6 +114,11 @@ func (ros *RegexOrString) IsMatch(input string) bool {
 	return ros.LiteralPattern == input
 }
 
+// Glob is the main globbing engine. It holds the original pattern and configuration
+// for a globbing operation.
+//
+// An instance is created with NewGlob, which allows for advanced configuration,
+// such as setting a custom filesystem or enabling case-insensitive matching.
 type Glob struct {
 	OriginalPattern string
 	IgnoreCase      bool
@@ -111,10 +162,22 @@ func (g *Glob) absForPlatform(p string) (string, error) {
 	return path.Clean(path.Join(g.normalizePathForPattern(cwd), p)), nil
 }
 
+// A GlobOption configures a Glob instance. It's a functional option type
+// used with NewGlob.
 type GlobOption func(*Glob)
 
+// WithIgnoreCase returns a GlobOption that sets the globber to perform
+// case-insensitive matching. On Windows, literal (non-wildcard) path
+// segments are case-insensitive by default. This option forces wildcards
+// and all other patterns to also ignore case.
 func WithIgnoreCase(v bool) GlobOption { return func(g *Glob) { g.IgnoreCase = v } }
 
+// NewGlob creates and returns a new Glob engine for the given pattern.
+// It uses the provided filesystem `fs` for all file operations. If `fs` is nil,
+// it defaults to the host operating system's filesystem.
+//
+// Functional options (GlobOption) can be provided to customize the globber's
+// behavior, such as enabling case-insensitive matching with WithIgnoreCase.
 func NewGlob(pattern string, fs filesystem.Filesystem, opts ...GlobOption) *Glob {
 	if fs == nil {
 		fs = filesystem.DefaultFS{}
@@ -143,11 +206,15 @@ func NewGlob(pattern string, fs filesystem.Filesystem, opts ...GlobOption) *Glob
 	return g
 }
 
+// String returns the original, unmodified pattern that was used to create the Glob instance.
 func (g *Glob) String() string { return g.OriginalPattern }
 
-func (g *Glob) ExpandNames() ([]string, error) {
+// Expand executes the glob pattern and returns all matching file paths.
+// It is the primary method for retrieving results from a configured Glob instance.
+// The function returns an empty, non-nil slice if no matches are found.
+func (g *Glob) Expand() ([]string, error) {
 	res, err := g.expandInternal(g.OriginalPattern, false)
-	if err != nil && g.IgnoreCase { // tolerant mode
+	if err != nil && g.IgnoreCase {
 		slog.Warn("Ignoring malformed glob pattern",
 			"pattern", g.OriginalPattern, "error", err)
 		return []string{}, nil
@@ -155,9 +222,12 @@ func (g *Glob) ExpandNames() ([]string, error) {
 	return res, err
 }
 
-func (g *Glob) Expand() ([]string, error) {
+// ExpandNames executes the glob pattern and returns all matching file paths.
+//
+// Deprecated: This function is an alias for Expand. Please use Expand instead.
+func (g *Glob) ExpandNames() ([]string, error) {
 	res, err := g.expandInternal(g.OriginalPattern, false)
-	if err != nil && g.IgnoreCase {
+	if err != nil && g.IgnoreCase { // tolerant mode
 		slog.Warn("Ignoring malformed glob pattern",
 			"pattern", g.OriginalPattern, "error", err)
 		return []string{}, nil
