@@ -5,7 +5,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path/filepath"
+	"path"
 	"strings"
 	"testing"
 	"time"
@@ -68,44 +68,61 @@ type MockFilesystem struct {
 
 func NewMockFilesystem(platform string) *MockFilesystem {
 	sep := "/"
+	cwd := "/"
 	if platform == "windows" {
 		sep = `\`
+		cwd = `C:\`
 	}
-	return &MockFilesystem{
-		files:     map[string]MockFileInfo{},
-		dirs:      map[string][]MockDirEntry{},
-		cwd:       "/",
+	fs := &MockFilesystem{
+		files:     make(map[string]MockFileInfo),
+		dirs:      make(map[string][]MockDirEntry),
+		cwd:       cwd,
 		platform:  platform,
 		separator: sep,
 	}
+	// Add the root directory
+	fs.AddFile(cwd, true)
+	return fs
 }
 
 func (m *MockFilesystem) Platform() string { return m.platform }
 
-func (m *MockFilesystem) normalizePath(p string) string {
+func (m *MockFilesystem) mockClean(p string) string {
+	isUnc := false
 	if m.platform == "windows" {
-		p = strings.ReplaceAll(p, "/", `\`)
-		switch {
-		case len(p) >= 2 && p[1] == ':':
-			return p // already absolute
-		case strings.HasPrefix(p, `\\`):
-			return p // UNC
-		case strings.HasPrefix(p, `\`):
-			return `C:` + p // rooted but drive-less
-		default:
-			return p // relative
+		p = strings.ReplaceAll(p, `\`, `/`)
+		if strings.HasPrefix(p, "//") {
+			isUnc = true
+			p = p[1:]
 		}
 	}
-	return strings.ReplaceAll(p, `\`, "/")
+	cleaned := path.Clean(p)
+	if m.platform == "windows" {
+		if isUnc {
+			cleaned = "/" + cleaned
+		}
+		cleaned = strings.ReplaceAll(cleaned, `/`, `\`)
+		if len(cleaned) == 2 && cleaned[1] == ':' {
+			cleaned += `\`
+		}
+	}
+	return cleaned
 }
 
 func (m *MockFilesystem) Stat(name string) (fs.FileInfo, error) {
-	abs, err := m.Abs(name)
+	absName, err := m.Abs(name)
 	if err != nil {
 		return nil, &fs.PathError{Op: "stat", Path: name, Err: err}
 	}
-	if info, ok := m.files[abs]; ok {
+	if info, exists := m.files[absName]; exists {
 		return info, nil
+	}
+	if m.platform == "windows" {
+		for p, info := range m.files {
+			if strings.EqualFold(p, absName) {
+				return info, nil
+			}
+		}
 	}
 	return nil, &fs.PathError{Op: "stat", Path: name, Err: fs.ErrNotExist}
 }
@@ -115,41 +132,99 @@ func (m *MockFilesystem) ReadDir(name string) ([]fs.DirEntry, error) {
 	if err != nil {
 		return nil, &fs.PathError{Op: "readdir", Path: name, Err: err}
 	}
-	entries, ok := m.dirs[abs]
-	if !ok {
-		return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrNotExist}
+
+	handleFound := func(entries []MockDirEntry) ([]fs.DirEntry, error) {
+		out := make([]fs.DirEntry, len(entries))
+		for i := range entries {
+			out[i] = entries[i]
+		}
+		return out, nil
 	}
-	out := make([]fs.DirEntry, len(entries))
-	for i := range entries {
-		out[i] = entries[i]
+
+	if entries, ok := m.dirs[abs]; ok {
+		return handleFound(entries)
 	}
-	return out, nil
+
+	if m.platform == "windows" {
+		for p, entries := range m.dirs {
+			if strings.EqualFold(p, abs) {
+				return handleFound(entries)
+			}
+		}
+	}
+
+	if _, err := m.Stat(name); err == nil {
+		return nil, &fs.PathError{Op: "readdir", Path: name, Err: fmt.Errorf("not a directory")}
+	}
+
+	return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrNotExist}
 }
 
 func (m *MockFilesystem) Getwd() (string, error) { return m.cwd, nil }
 
-func (m *MockFilesystem) Abs(path string) (string, error) {
-	path = m.normalizePath(path)
+func (m *MockFilesystem) isAbs(p string) bool {
 	if m.platform == "windows" {
-		if filepath.IsAbs(path) || strings.HasPrefix(path, `C:`) {
-			return path, nil
-		}
-		if strings.HasPrefix(path, `\`) {
-			return `C:` + path, nil
-		}
-		return filepath.Join(m.cwd, path), nil
+		return (len(p) > 2 && p[1] == ':' && (p[2] == '\\' || p[2] == '/')) || strings.HasPrefix(p, `\`) || strings.HasPrefix(p, `/`)
 	}
-	if filepath.IsAbs(path) {
-		return path, nil
+	return strings.HasPrefix(p, "/")
+}
+
+func (m *MockFilesystem) Abs(path string) (string, error) {
+	if m.platform == "windows" {
+		path = strings.ReplaceAll(path, "/", `\`)
+	} else {
+		path = strings.ReplaceAll(path, `\`, "/")
 	}
-	return filepath.Join(m.cwd, path), nil
+
+	if m.isAbs(path) {
+		return m.mockClean(path), nil
+	}
+
+	fullPath := m.cwd + m.separator + path
+	return m.mockClean(fullPath), nil
+}
+
+func (m *MockFilesystem) mockDir(p string) string {
+	if (m.platform == "windows" && len(p) == 3 && p[1] == ':' && p[2] == '\\') || (m.platform == "unix" && p == "/") {
+		return p
+	}
+
+	var normalized string
+	if m.platform == "windows" {
+		normalized = strings.ReplaceAll(p, `\`, "/")
+	} else {
+		normalized = p
+	}
+
+	dir := path.Dir(normalized)
+
+	if m.platform == "windows" {
+		dir = strings.ReplaceAll(dir, "/", `\`)
+		if len(dir) == 2 && dir[1] == ':' {
+			return dir + `\`
+		}
+	}
+	return dir
+}
+
+func (m *MockFilesystem) mockBase(p string) string {
+	lastSep := strings.LastIndex(p, m.separator)
+	if lastSep == -1 {
+		return p
+	}
+	if m.platform == "windows" && lastSep == 2 && p[1] == ':' { // C:\ is base of C:\foo
+		return p[lastSep+1:]
+	}
+	if lastSep == len(p)-1 {
+		return ""
+	}
+	return p[lastSep+1:]
 }
 
 func (m *MockFilesystem) AddFile(path string, isDir bool) {
 	abs, _ := m.Abs(path)
-
 	info := MockFileInfo{
-		name:    filepath.Base(abs),
+		name:    m.mockBase(abs),
 		size:    100,
 		mode:    0o644,
 		modTime: time.Now(),
@@ -157,18 +232,23 @@ func (m *MockFilesystem) AddFile(path string, isDir bool) {
 	}
 	if isDir {
 		info.mode = fs.ModeDir | 0o755
+		if _, exists := m.dirs[abs]; !exists {
+			m.dirs[abs] = []MockDirEntry{}
+		}
 	}
 	m.files[abs] = info
 
-	parent := filepath.Dir(abs)
-	if parent != abs {
-		m.dirs[parent] = append(m.dirs[parent], MockDirEntry{
-			name: info.name, isDir: isDir, info: info,
-		})
+	parent := m.mockDir(abs)
+	if parent != "" && parent != abs {
+		entry := MockDirEntry{name: info.name, isDir: isDir, info: info}
+		m.dirs[parent] = append(m.dirs[parent], entry)
 	}
 }
 
-func (m *MockFilesystem) SetCwd(cwd string) { m.cwd = m.normalizePath(cwd) }
+func (m *MockFilesystem) SetCwd(cwd string) {
+	absCwd, _ := m.Abs(cwd)
+	m.cwd = absCwd
+}
 
 // Stubbed-out methods not needed in these tests.
 func (*MockFilesystem) MkdirAll(string, fs.FileMode) error          { return nil }
@@ -182,8 +262,6 @@ func setupLinuxFS() *MockFilesystem {
 	fs := NewMockFilesystem("unix")
 	fs.SetCwd("/home/user")
 
-	// Create directory structure
-	fs.AddFile("/", true)
 	fs.AddFile("/home", true)
 	fs.AddFile("/home/user", true)
 	fs.AddFile("/home/user/documents", true)
@@ -208,8 +286,6 @@ func setupWindowsFS() *MockFilesystem {
 	fs := NewMockFilesystem("windows")
 	fs.SetCwd("C:\\Users\\User")
 
-	// Create directory structure
-	fs.AddFile("C:\\", true)
 	fs.AddFile("C:\\Users", true)
 	fs.AddFile("C:\\Users\\User", true)
 	fs.AddFile("C:\\Users\\User\\Documents", true)
@@ -247,8 +323,8 @@ func TestExpandNames_BasicPatterns_ReturnExpected(t *testing.T) {
 				"/home/user/documents/file2.txt",
 			},
 			wantWin: []string{
-				"C:/Users/User/Documents/file1.txt",
-				"C:/Users/User/Documents/file2.txt",
+				`C:\Users\User\Documents\file1.txt`,
+				`C:\Users\User\Documents\file2.txt`,
 			},
 		},
 		{
@@ -259,8 +335,8 @@ func TestExpandNames_BasicPatterns_ReturnExpected(t *testing.T) {
 				"/home/user/documents/file2.txt",
 			},
 			wantWin: []string{
-				"C:/Users/User/Documents/file1.txt",
-				"C:/Users/User/Documents/file2.txt",
+				`C:\Users\User\Documents\file1.txt`,
+				`C:\Users\User\Documents\file2.txt`,
 			},
 		},
 		{
@@ -272,9 +348,9 @@ func TestExpandNames_BasicPatterns_ReturnExpected(t *testing.T) {
 				"/home/user/documents/subdir/nested.txt",
 			},
 			wantWin: []string{
-				"C:/Users/User/Documents/file1.txt",
-				"C:/Users/User/Documents/file2.txt",
-				"C:/Users/User/Documents/subdir/nested.txt",
+				`C:\Users\User\Documents\file1.txt`,
+				`C:\Users\User\Documents\file2.txt`,
+				`C:\Users\User\Documents\subdir\nested.txt`,
 			},
 		},
 		{
@@ -285,8 +361,8 @@ func TestExpandNames_BasicPatterns_ReturnExpected(t *testing.T) {
 				"/home/user/documents/file2.txt",
 			},
 			wantWin: []string{
-				"C:/Users/User/Documents/file1.txt",
-				"C:/Users/User/Documents/file2.txt",
+				`C:\Users\User\Documents\file1.txt`,
+				`C:\Users\User\Documents\file2.txt`,
 			},
 		},
 		{
@@ -297,8 +373,8 @@ func TestExpandNames_BasicPatterns_ReturnExpected(t *testing.T) {
 				"/home/user/documents/file2.txt",
 			},
 			wantWin: []string{
-				"C:/Users/User/Documents/file1.txt",
-				"C:/Users/User/Documents/file2.txt",
+				`C:\Users\User\Documents\file1.txt`,
+				`C:\Users\User\Documents\file2.txt`,
 			},
 		},
 	}
@@ -345,11 +421,11 @@ func TestExpandNames_AbsolutePaths_CorrectPerPlatform(t *testing.T) {
 		},
 		{
 			name:     "absolute path windows",
-			pattern:  "C:\\Users\\User\\Documents\\*.txt",
+			pattern:  `C:\Users\User\Documents\*.txt`,
 			wantUnix: []string{}, // Should work differently on Unix
 			wantWin: []string{
-				"C:/Users/User/Documents/file1.txt",
-				"C:/Users/User/Documents/file2.txt",
+				`C:\Users\User\Documents\file1.txt`,
+				`C:\Users\User\Documents\file2.txt`,
 			},
 		},
 	}
@@ -399,14 +475,14 @@ func TestExpandNames_RecursivePatterns_ReturnExpected(t *testing.T) {
 				"/home/user/documents/subdir/deep/file.log",
 			},
 			wantWin: []string{
-				"C:/Users/User/Documents",
-				"C:/Users/User/Documents/file1.txt",
-				"C:/Users/User/Documents/file2.txt",
-				"C:/Users/User/Documents/report.pdf",
-				"C:/Users/User/Documents/subdir",
-				"C:/Users/User/Documents/subdir/nested.txt",
-				"C:/Users/User/Documents/subdir/deep",
-				"C:/Users/User/Documents/subdir/deep/file.log",
+				`C:\Users\User\Documents`,
+				`C:\Users\User\Documents\file1.txt`,
+				`C:\Users\User\Documents\file2.txt`,
+				`C:\Users\User\Documents\report.pdf`,
+				`C:\Users\User\Documents\subdir`,
+				`C:\Users\User\Documents\subdir\nested.txt`,
+				`C:\Users\User\Documents\subdir\deep`,
+				`C:\Users\User\Documents\subdir\deep\file.log`,
 			},
 		},
 		{
@@ -418,9 +494,9 @@ func TestExpandNames_RecursivePatterns_ReturnExpected(t *testing.T) {
 				"/home/user/documents/subdir/nested.txt",
 			},
 			wantWin: []string{
-				"C:/Users/User/Documents/file1.txt",
-				"C:/Users/User/Documents/file2.txt",
-				"C:/Users/User/Documents/subdir/nested.txt",
+				`C:\Users\User\Documents\file1.txt`,
+				`C:\Users\User\Documents\file2.txt`,
+				`C:\Users\User\Documents\subdir\nested.txt`,
 			},
 		},
 	}
@@ -504,7 +580,7 @@ func TestExpandNames_NonGlobInputs_ReturnsPathOrEmpty(t *testing.T) {
 				"/home/user/documents/file1.txt",
 			},
 			wantWin: []string{
-				"C:/Users/User/Documents/file1.txt",
+				`C:\Users\User\Documents\file1.txt`,
 			},
 		},
 		{
@@ -539,23 +615,17 @@ func TestExpandNames_NonGlobInputs_ReturnsPathOrEmpty(t *testing.T) {
 
 func TestExpandNames_NoMatch_ReturnsEmptySlice(t *testing.T) {
 	t.Parallel()
+	forPlatforms(t, func(t *testing.T, fs *MockFilesystem) {
+		// Arrange
+		g := fsglob.NewGlob("documents/*.nonexistent", fs)
 
-	// Arrange
-	fs := &MockFilesystem{
-		files:     make(map[string]MockFileInfo),
-		dirs:      make(map[string][]MockDirEntry),
-		cwd:       "/",
-		platform:  "unix",
-		separator: "/",
-	}
-	g := fsglob.NewGlob("documents/*.txt", fs)
+		// Act
+		got, err := g.ExpandNames()
 
-	// Act
-	got, err := g.ExpandNames()
-
-	// Assert
-	assert.NoError(t, err)
-	assert.Empty(t, got, "Expected empty results for non-matching pattern")
+		// Assert
+		assert.NoError(t, err)
+		assert.Empty(t, got, "Expected empty results for non-matching pattern")
+	})
 }
 
 func TestExpandNames_LargeTree_FindsAllTxtFiles(t *testing.T) {
@@ -564,7 +634,6 @@ func TestExpandNames_LargeTree_FindsAllTxtFiles(t *testing.T) {
 	// Arrange
 	fs := NewMockFilesystem("unix")
 	fs.SetCwd("/home/user")
-	fs.AddFile("/", true)
 	fs.AddFile("/home", true)
 	fs.AddFile("/home/user", true)
 	fs.AddFile("/home/user/large", true)
@@ -609,13 +678,29 @@ func TestExpandNames_CaseSensitivity_VariousFlags(t *testing.T) {
 		name       string
 		pattern    string
 		ignoreCase bool
-		wantUnix   int
-		wantWin    int
+		wantUnix   []string
+		wantWin    []string
 	}{
-		{"mixed-case sensitive", "documents/*.TXT", false, 1, 1},
-		{"mixed-case insensitive", "documents/*.TXT", true, 4, 4},
-		{"lower-case sensitive", "documents/*.txt", false, 3, 3},
-		{"lower-case insensitive", "documents/*.txt", true, 4, 4},
+		{
+			"mixed-case sensitive", "documents/*.TXT", false,
+			[]string{"/home/user/documents/File1.TXT"},
+			[]string{`C:\Users\User\Documents\File1.TXT`},
+		},
+		{
+			"mixed-case insensitive", "documents/*.TXT", true,
+			[]string{"/home/user/documents/file1.txt", "/home/user/documents/file2.txt", "/home/user/documents/File1.TXT", "/home/user/documents/FILE2.txt"},
+			[]string{`C:\Users\User\Documents\file1.txt`, `C:\Users\User\Documents\file2.txt`, `C:\Users\User\Documents\File1.TXT`, `C:\Users\User\Documents\FILE2.txt`},
+		},
+		{
+			"lower-case sensitive", "documents/*.txt", false,
+			[]string{"/home/user/documents/file1.txt", "/home/user/documents/file2.txt", "/home/user/documents/FILE2.txt"},
+			[]string{`C:\Users\User\Documents\file1.txt`, `C:\Users\User\Documents\file2.txt`, `C:\Users\User\Documents\FILE2.txt`},
+		},
+		{
+			"lower-case insensitive", "documents/*.txt", true,
+			[]string{"/home/user/documents/file1.txt", "/home/user/documents/file2.txt", "/home/user/documents/File1.TXT", "/home/user/documents/FILE2.txt"},
+			[]string{`C:\Users\User\Documents\file1.txt`, `C:\Users\User\Documents\file2.txt`, `C:\Users\User\Documents\File1.TXT`, `C:\Users\User\Documents\FILE2.txt`},
+		},
 	}
 
 	for _, tc := range cases {
@@ -635,7 +720,7 @@ func TestExpandNames_CaseSensitivity_VariousFlags(t *testing.T) {
 				if fs.platform == "windows" {
 					want = tc.wantWin
 				}
-				assert.Len(t, got, want)
+				testutil.PathsMatch(t, want, got)
 			})
 		})
 	}
@@ -659,9 +744,9 @@ func TestExpandNames_ComplexBraceExpansion_ReturnsExpected(t *testing.T) {
 				"/home/user/documents/report.pdf",
 			},
 			wantWin: []string{
-				"C:/Users/User/Documents/file1.txt",
-				"C:/Users/User/Documents/file2.txt",
-				"C:/Users/User/Documents/report.pdf",
+				`C:\Users\User\Documents\file1.txt`,
+				`C:\Users\User\Documents\file2.txt`,
+				`C:\Users\User\Documents\report.pdf`,
 			},
 		},
 		{
@@ -673,9 +758,9 @@ func TestExpandNames_ComplexBraceExpansion_ReturnsExpected(t *testing.T) {
 				"/home/user/pictures/photo1.jpg",
 			},
 			wantWin: []string{
-				"C:/Users/User/Documents/file1.txt",
-				"C:/Users/User/Documents/file2.txt",
-				"C:/Users/User/Pictures/photo1.jpg",
+				`C:\Users\User\Documents\file1.txt`,
+				`C:\Users\User\Documents\file2.txt`,
+				`C:\Users\User\Pictures\photo1.jpg`,
 			},
 		},
 	}
@@ -716,10 +801,7 @@ func TestExpandNames_DotAndDotDot_Patterns(t *testing.T) {
 
 			// Assert
 			require.NoError(t, err)
-			expectedCwd := "/home/user"
-			if fs.platform == "windows" {
-				expectedCwd = "C:/Users/User"
-			}
+			expectedCwd, _ := fs.Getwd()
 			testutil.PathsMatch(t, []string{expectedCwd}, got)
 		})
 	})
@@ -735,10 +817,8 @@ func TestExpandNames_DotAndDotDot_Patterns(t *testing.T) {
 
 			// Assert
 			require.NoError(t, err)
-			expectedParent := "/home"
-			if fs.platform == "windows" {
-				expectedParent = "C:/Users"
-			}
+			cwd, _ := fs.Getwd()
+			expectedParent := fs.mockDir(cwd)
 			testutil.PathsMatch(t, []string{expectedParent}, got)
 		})
 	})
@@ -751,7 +831,11 @@ func TestGetFilesPublicAPI(t *testing.T) {
 	dir := t.TempDir()
 	cwd, err := os.Getwd()
 	require.NoError(t, err) // Use require for test setup
-	defer os.Chdir(cwd)
+	defer func() {
+		err := os.Chdir(cwd)
+		require.NoError(t, err, "failed to change back to original directory")
+	}()
+
 	err = os.Chdir(dir)
 	require.NoError(t, err)
 

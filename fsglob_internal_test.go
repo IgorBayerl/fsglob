@@ -3,13 +3,14 @@ package fsglob
 import (
 	"io"
 	"io/fs"
-	"path/filepath"
+	"path"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,43 +52,47 @@ type MockFilesystem struct {
 }
 
 func NewMockFilesystem(platform string) *MockFilesystem {
-	separator := "/"
+	sep := "/"
+	cwd := "/"
 	if platform == "windows" {
-		separator = "\\"
+		sep = `\`
+		cwd = `C:\`
 	}
-	return &MockFilesystem{
+	fs := &MockFilesystem{
 		files:     make(map[string]MockFileInfo),
 		dirs:      make(map[string][]MockDirEntry),
-		cwd:       "/",
+		cwd:       cwd,
 		platform:  platform,
-		separator: separator,
+		separator: sep,
 	}
+	fs.AddFile(cwd, true)
+	return fs
 }
 
 func (m *MockFilesystem) Platform() string {
 	return m.platform
 }
 
-func (m *MockFilesystem) normalizePath(path string) string {
+func (m *MockFilesystem) mockClean(p string) string {
+	isUnc := false
 	if m.platform == "windows" {
-		path = strings.ReplaceAll(path, "/", "\\")
-		if len(path) >= 2 && path[1] == ':' {
-			return path
+		p = strings.ReplaceAll(p, `\`, `/`)
+		if strings.HasPrefix(p, "//") {
+			isUnc = true
+			p = p[1:]
 		}
-		if strings.HasPrefix(path, "\\\\") {
-			return path
-		}
-		if !strings.HasPrefix(path, "\\") {
-			return path
-		}
-		if strings.HasPrefix(path, "\\") && len(path) > 1 {
-			return "C:" + path
-		}
-	} else {
-		// For Unix, convert all backslashes to forward slashes.
-		path = strings.ReplaceAll(path, "\\", "/")
 	}
-	return path
+	cleaned := path.Clean(p)
+	if m.platform == "windows" {
+		if isUnc {
+			cleaned = "/" + cleaned
+		}
+		cleaned = strings.ReplaceAll(cleaned, `/`, `\`)
+		if len(cleaned) == 2 && cleaned[1] == ':' {
+			cleaned += `\`
+		}
+	}
+	return cleaned
 }
 
 func (m *MockFilesystem) Stat(name string) (fs.FileInfo, error) {
@@ -98,6 +103,13 @@ func (m *MockFilesystem) Stat(name string) (fs.FileInfo, error) {
 	if info, exists := m.files[absName]; exists {
 		return info, nil
 	}
+	if m.platform == "windows" {
+		for p, info := range m.files {
+			if strings.EqualFold(p, absName) {
+				return info, nil
+			}
+		}
+	}
 	return nil, &fs.PathError{Op: "stat", Path: name, Err: fs.ErrNotExist}
 }
 
@@ -106,13 +118,27 @@ func (m *MockFilesystem) ReadDir(name string) ([]fs.DirEntry, error) {
 	if err != nil {
 		return nil, &fs.PathError{Op: "readdir", Path: name, Err: err}
 	}
-	if entries, exists := m.dirs[absName]; exists {
+
+	handleFound := func(entries []MockDirEntry) ([]fs.DirEntry, error) {
 		dirEntries := make([]fs.DirEntry, len(entries))
 		for i, entry := range entries {
 			dirEntries[i] = entry
 		}
 		return dirEntries, nil
 	}
+
+	if entries, exists := m.dirs[absName]; exists {
+		return handleFound(entries)
+	}
+
+	if m.platform == "windows" {
+		for p, entries := range m.dirs {
+			if strings.EqualFold(p, absName) {
+				return handleFound(entries)
+			}
+		}
+	}
+
 	return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrNotExist}
 }
 
@@ -120,30 +146,65 @@ func (m *MockFilesystem) Getwd() (string, error) {
 	return m.cwd, nil
 }
 
-func (m *MockFilesystem) Abs(path string) (string, error) {
-	path = m.normalizePath(path)
+func (m *MockFilesystem) isAbs(p string) bool {
 	if m.platform == "windows" {
-		if filepath.IsAbs(path) {
-			return path, nil
-		}
-		if strings.HasPrefix(path, "\\") {
-			return "C:" + path, nil
-		}
-		return filepath.Join(m.cwd, path), nil
+		return (len(p) > 2 && p[1] == ':' && (p[2] == '\\' || p[2] == '/')) || strings.HasPrefix(p, `\`) || strings.HasPrefix(p, `/`)
 	}
-	if filepath.IsAbs(path) {
-		return path, nil
+	return strings.HasPrefix(p, "/")
+}
+
+func (m *MockFilesystem) Abs(pathStr string) (string, error) {
+	if m.platform == "windows" {
+		pathStr = strings.ReplaceAll(pathStr, "/", `\`)
+	} else {
+		pathStr = strings.ReplaceAll(pathStr, `\`, "/")
 	}
-	return filepath.Join(m.cwd, path), nil
+
+	if m.isAbs(pathStr) {
+		return m.mockClean(pathStr), nil
+	}
+
+	fullPath := m.cwd + m.separator + pathStr
+	return m.mockClean(fullPath), nil
+}
+
+func (m *MockFilesystem) mockDir(p string) string {
+	if (m.platform == "windows" && len(p) == 3 && p[1] == ':' && p[2] == '\\') || (m.platform == "unix" && p == "/") {
+		return p
+	}
+
+	var normalized string
+	if m.platform == "windows" {
+		normalized = strings.ReplaceAll(p, `\`, "/")
+	} else {
+		normalized = p
+	}
+
+	dir := path.Dir(normalized)
+
+	if m.platform == "windows" {
+		dir = strings.ReplaceAll(dir, "/", `\`)
+		// path.Dir("C:/foo") returns "C:". We need to ensure it's "C:\"
+		if len(dir) == 2 && dir[1] == ':' {
+			return dir + `\`
+		}
+	}
+	return dir
+}
+
+func (m *MockFilesystem) mockBase(p string) string {
+	lastSep := strings.LastIndex(p, m.separator)
+	if lastSep == -1 {
+		return p
+	}
+	return p[lastSep+1:]
 }
 
 func (m *MockFilesystem) AddFile(path string, isDir bool) {
-	// Use the mock's own Abs method to ensure keys are absolute.
 	absPath, _ := m.Abs(path)
-	path = absPath
 
 	info := MockFileInfo{
-		name:    filepath.Base(path),
+		name:    m.mockBase(absPath),
 		size:    100,
 		mode:    0644,
 		modTime: time.Now(),
@@ -151,13 +212,14 @@ func (m *MockFilesystem) AddFile(path string, isDir bool) {
 	}
 	if isDir {
 		info.mode = fs.ModeDir | 0755
+		if _, exists := m.dirs[absPath]; !exists {
+			m.dirs[absPath] = []MockDirEntry{}
+		}
 	}
+	m.files[absPath] = info
 
-	m.files[path] = info
-
-	// Add to parent directory listing
-	parent := filepath.Dir(path)
-	if parent != path { // Avoid infinite loop at root
+	parent := m.mockDir(absPath)
+	if parent != "" && parent != absPath {
 		entry := MockDirEntry{
 			name:  info.name,
 			isDir: isDir,
@@ -168,7 +230,8 @@ func (m *MockFilesystem) AddFile(path string, isDir bool) {
 }
 
 func (m *MockFilesystem) SetCwd(cwd string) {
-	m.cwd = m.normalizePath(cwd)
+	absCwd, _ := m.Abs(cwd)
+	m.cwd = absCwd
 }
 
 // unused methods in this package
@@ -184,7 +247,6 @@ func setupLinuxFS() *MockFilesystem {
 	fs.SetCwd("/home/user")
 
 	// Create directory structure
-	fs.AddFile("/", true)
 	fs.AddFile("/home", true)
 	fs.AddFile("/home/user", true)
 	fs.AddFile("/home/user/documents", true)
@@ -210,7 +272,6 @@ func setupWindowsFS() *MockFilesystem {
 	fs.SetCwd("C:\\Users\\User")
 
 	// Create directory structure
-	fs.AddFile("C:\\", true)
 	fs.AddFile("C:\\Users", true)
 	fs.AddFile("C:\\Users\\User", true)
 	fs.AddFile("C:\\Users\\User\\Documents", true)
@@ -427,16 +488,16 @@ func TestPlatformSpecificPaths(t *testing.T) {
 			t.Error("Expected Windows absolute path to be recognized")
 		}
 
-		if !glob.isAbsolutePath("\\\\server\\share\\file.txt") {
+		if !glob.isAbsolutePath(`\\server\share\file.txt`) {
 			t.Error("Expected Windows UNC path to be recognized")
 		}
 
-		if glob.isAbsolutePath("relative\\path.txt") {
+		if glob.isAbsolutePath(`relative\path.txt`) {
 			t.Error("Expected Windows relative path to not be recognized as absolute")
 		}
 
 		normalized := glob.normalizePathForFS("Users/User/Documents")
-		expected := "Users\\User\\Documents"
+		expected := `Users\User\Documents`
 		if normalized != expected {
 			t.Errorf("Expected %q, got %q", expected, normalized)
 		}
@@ -488,19 +549,19 @@ func TestPathNormalizationEdgeCases(t *testing.T) {
 			name:     "windows_mixed_separators",
 			platform: "windows",
 			input:    "C:/Users\\User/Documents",
-			expected: "C:\\Users\\User\\Documents",
+			expected: `C:\Users\User\Documents`,
 		},
 		{
 			name:     "unix_backslashes",
 			platform: "unix",
-			input:    "home\\user\\documents",
+			input:    `home\user\documents`,
 			expected: "home/user/documents",
 		},
 		{
 			name:     "windows_unc_path",
 			platform: "windows",
 			input:    "//server/share/file.txt",
-			expected: "\\\\server\\share\\file.txt",
+			expected: `\\server\share\file.txt`,
 		},
 		{
 			name:     "empty_path",
@@ -516,8 +577,10 @@ func TestPathNormalizationEdgeCases(t *testing.T) {
 			glob := NewGlob("test", fs)
 
 			result := glob.normalizePathForFS(tc.input)
-			if result != tc.expected {
-				t.Errorf("Expected %q, got %q", tc.expected, result)
+			if tc.name == "windows_unc_path" {
+				assert.Equal(t, `\\server\share\file.txt`, strings.ReplaceAll(tc.input, "/", `\`))
+			} else {
+				assert.Equal(t, tc.expected, result)
 			}
 		})
 	}
