@@ -1,7 +1,7 @@
 # fsglob
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/IgorBayerl/fsglob.svg)](https://pkg.go.dev/github.com/IgorBayerl/fsglob)
-
+[![Go Report Card](https://goreportcard.com/badge/github.com/IgorBayerl/fsglob)](https://goreportcard.com/report/github.com/IgorBayerl/fsglob)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 `fsglob` is a Go package for finding file paths that match glob patterns. It operates by walking a filesystem and is designed to be cross-platform and extensible.
